@@ -490,6 +490,9 @@ export interface ElectronAPI {
   /** 重排工作区顺序 */
   reorderAgentWorkspaces: (orderedIds: string[]) => Promise<AgentWorkspace[]>
 
+  /** 受限写入工作区文件（薄沙箱） */
+  writeToWorkspace: (slug: string, filePath: string, content: string) => Promise<{ success: true; filePath: string } | { success: false; error: string }>
+
   // ===== 工作区能力（MCP + Skill） =====
 
   /** 获取工作区能力摘要 */
@@ -1481,6 +1484,10 @@ const electronAPI: ElectronAPI = {
 
   reorderAgentWorkspaces: (orderedIds: string[]) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.REORDER_WORKSPACES, orderedIds)
+  },
+
+  writeToWorkspace: (slug: string, filePath: string, content: string) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.WRITE_TO_WORKSPACE, slug, filePath, content)
   },
 
   // 工作区能力（MCP + Skill）
