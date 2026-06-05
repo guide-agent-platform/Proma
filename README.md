@@ -303,3 +303,46 @@ Proma 社区版采用 [GNU Affero General Public License v3.0（AGPL-3.0）](./L
 **商业授权（豁免 AGPL-3.0 义务）**：如果你希望将 Proma 集成到闭源产品、对外提供 SaaS 服务但不想公开衍生代码，或有其他无法满足 AGPL-3.0 条款的商业场景，请通过邮件联系获取商业许可：[erlichliu@gmail.com](mailto:erlichliu@gmail.com)。
 
 向本项目提交 Pull Request 即视为同意将贡献以 AGPL-3.0 及未来商业许可形式授权给项目维护者。
+
+---
+
+## W1 启动（guide-agent-platform 向导弹性 Agent）
+
+> 面向 guide-agent-platform W1 后端验收，演示「向导弹性 Agent」。
+
+### 1. 安装依赖并启动桌面
+
+```bash
+bun install
+bun run dev:electron
+```
+
+> 开发模式数据目录是 `~/.proma-dev/`（**不是** `~/.proma/`）。下方 workspace 也建在此目录。
+
+### 2. 准备「向导弹性」workspace
+
+```bash
+bun run scripts/create-workspace.ts   # 或: node scripts/create-workspace.ts
+```
+
+执行后会创建 `~/.proma-dev/agent-workspaces/guide-elasticity/`（含 plugin manifest 与 SKILL.md）。
+若 `skills/guide-elasticity/SKILL.md` 不存在，从交接产物补放即可。脚本幂等，可重复运行。
+
+### 3. 演示步骤
+
+1. 启动后在窗口里**新建 session**，workspace 选 **向导弹性（guide-elasticity）**，任选一个 channel。
+2. 发第一条：`帮我做一个 hello world 页面` —— 观察是否按 Skill 行为问 **1-3 个关键问题**。
+3. 发第二条（明确需求）：`做一个记账应用，支持收入/支出记录和按月统计` —— 观察是否调用 **Write 工具**写 PRD 到 `01_PRD/prd.md`。
+
+### 4. 自检命令
+
+```bash
+bun run typecheck   # 类型检查
+bun test            # 单元测试（含 writeToWorkspace 薄沙箱用例）
+```
+
+### 相关交付物
+
+- 薄沙箱：`apps/electron/src/main/lib/agent-workspace-manager.ts` 的 `writeToWorkspace()`
+- IPC：`window.electronAPI.writeToWorkspace(slug, filePath, content)`
+- W1 简报：`docs/w1-summary-backend.md`

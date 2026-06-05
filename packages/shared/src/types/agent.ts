@@ -1314,6 +1314,8 @@ export const AGENT_IPC_CHANNELS = {
   DELETE_WORKSPACE: 'agent:delete-workspace',
   /** 重排工作区顺序 */
   REORDER_WORKSPACES: 'agent:reorder-workspaces',
+  /** 受限写入工作区文件（薄沙箱：路径越界/超大/危险扩展名一律拒绝） */
+  WRITE_TO_WORKSPACE: 'agent:write-to-workspace',
 
   // 标题生成
   /** 生成 Agent 会话标题 */

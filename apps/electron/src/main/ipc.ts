@@ -183,6 +183,7 @@ import type { CleanupOptions } from './lib/storage-service'
 import {
   listAgentWorkspaces,
   createAgentWorkspace,
+  writeToWorkspace,
   updateAgentWorkspace,
   deleteAgentWorkspace,
   reorderAgentWorkspaces,
@@ -1859,6 +1860,14 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.REORDER_WORKSPACES,
     async (_, orderedIds: string[]): Promise<AgentWorkspace[]> => {
       return reorderAgentWorkspaces(orderedIds)
+    }
+  )
+
+  // 受限写入工作区文件（薄沙箱）
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.WRITE_TO_WORKSPACE,
+    async (_, slug: string, filePath: string, content: string) => {
+      return writeToWorkspace(slug, filePath, content)
     }
   )
 

@@ -7,9 +7,10 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, rmSync, mkdirSync, statSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
+import { mkdir as mkdirAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import { writeJsonFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
-import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
+import { join, resolve, relative, isAbsolute, dirname, basename, extname } from 'node:path'
 import {
   getAgentWorkspacesIndexPath,
   getAgentWorkspacePath,
@@ -201,6 +202,70 @@ export function createAgentWorkspace(name: string): AgentWorkspace {
 
   console.log(`[Agent 工作区] 已创建工作区: ${name} (slug: ${slug})`)
   return workspace
+}
+
+// ===== 薄沙箱：受限写入工作区 =====
+
+/** 单文件写入大小上限（10 MB），超过拒绝，防止 Agent 写超大文件耗尽磁盘 */
+const WORKSPACE_FILE_SIZE_LIMIT = 10 * 1024 * 1024
+/** 允许写入的扩展名白名单（小写、不含点），拒绝可执行/脚本等危险类型 */
+const WORKSPACE_FILE_EXT_ALLOWLIST = new Set([
+  'html', 'css', 'js', 'ts', 'jsx', 'tsx', 'json',
+  'md', 'txt', 'py', 'svg', 'png', 'jpg', 'jpeg', 'gif',
+])
+
+export type WriteToWorkspaceError =
+  | 'NO_WORKSPACE'
+  | 'PATH_TRAVERSAL'
+  | 'FILE_TOO_LARGE'
+  | 'EXT_NOT_ALLOWED'
+
+/**
+ * 受限写入工作区文件（薄沙箱）。
+ *
+ * 在 Proma 既有目录隔离之上补一层写入校验：越界路径、超大文件、危险扩展名一律拒绝。
+ * 任何校验失败返回错误对象，不抛异常。暂不做符号链接检测（Phase 2 再加）。
+ */
+export async function writeToWorkspace(
+  slug: string,
+  filePath: string,
+  content: string | Buffer,
+): Promise<{ success: true; filePath: string } | { success: false; error: WriteToWorkspaceError }> {
+  if (!listAgentWorkspaces().some((w) => w.slug === slug)) {
+    return { success: false, error: 'NO_WORKSPACE' }
+  }
+
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return { success: false, error: 'PATH_TRAVERSAL' }
+  }
+  const normalized = filePath.replace(/\\/g, '/')
+  if (isAbsolute(filePath) || normalized.startsWith('/')) {
+    return { success: false, error: 'PATH_TRAVERSAL' }
+  }
+  if (normalized.split('/').some((seg) => seg === '..')) {
+    return { success: false, error: 'PATH_TRAVERSAL' }
+  }
+
+  const wsRoot = getAgentWorkspacePath(slug)
+  const resolved = resolve(wsRoot, normalized)
+  const rel = relative(wsRoot, resolved)
+  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
+    return { success: false, error: 'PATH_TRAVERSAL' }
+  }
+
+  const ext = extname(resolved).slice(1).toLowerCase()
+  if (!WORKSPACE_FILE_EXT_ALLOWLIST.has(ext)) {
+    return { success: false, error: 'EXT_NOT_ALLOWED' }
+  }
+
+  const byteLen = typeof content === 'string' ? Buffer.byteLength(content, 'utf-8') : content.length
+  if (byteLen > WORKSPACE_FILE_SIZE_LIMIT) {
+    return { success: false, error: 'FILE_TOO_LARGE' }
+  }
+
+  await mkdirAsync(dirname(resolved), { recursive: true })
+  await writeFileAsync(resolved, content)
+  return { success: true, filePath: resolved }
 }
 
 /** 更新工作区名称（slug 和目录不变） */
