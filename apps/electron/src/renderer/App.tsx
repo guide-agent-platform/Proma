@@ -12,6 +12,21 @@ import * as React from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import type {
+  AgentStreamEvent,
+  AgentStreamCompletePayload,
+  AgentStreamPayload,
+  SDKAssistantMessage,
+  AskUserRequest,
+  AskUserQuestionOption,
+} from '@proma/shared'
+
+// ===== 工具 =====
+
+/** 轻量唯一 id，替代 Date.now().toString() 撞 id 的隐患 */
+function cuid(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
 
 // ===== 类型 =====
 
@@ -19,24 +34,14 @@ interface Message {
   id: string
   role: 'system' | 'user'
   text: string
-  options?: { label: string; value: string }[]
+  /** ask_user 交互的候选项（来自 AskUserQuestion.options，无 value 字段） */
+  options?: AskUserQuestionOption[]
 }
 
 // ===== 对话预设 =====
 
 const INITIAL_MESSAGES: Message[] = [
-  { id: '1', role: 'system', text: '你好！你想做什么？告诉我你的想法，我帮你实现。' },
-  { id: '2', role: 'user', text: '帮我做一个日常记账应用' },
-  {
-    id: '3', role: 'system', text: '明白了。主要记录什么类型的开销？',
-    options: [
-      { label: '🍜 日常开销', value: 'daily' },
-      { label: '💼 生意账目', value: 'business' },
-      { label: '✨ 你帮我决定', value: 'auto' },
-    ],
-  },
-  { id: '4', role: 'user', text: '日常开销' },
-  { id: '5', role: 'system', text: '好的，让我先生成一个草图给你看看方向对不对……右边已经可以看到预览了。试试点击右侧预览中的任意元素，告诉我哪里不满意。' },
+  { id: 'boot', role: 'system', text: '正在连接向导弹性 workspace…' },
 ]
 
 // ===== Mock HTML（记账应用草图 — 分类用快捷标签点选） =====
@@ -104,6 +109,12 @@ export default function App(): React.ReactElement {
   const [messages, setMessages] = React.useState<Message[]>(INITIAL_MESSAGES)
   const [inputValue, setInputValue] = React.useState('')
   const [correction, setCorrection] = React.useState<{ tag: string; textContent: string } | null>(null)
+  const [sessionId, setSessionId] = React.useState<string | null>(null)
+  const [channelId, setChannelId] = React.useState<string | undefined>(undefined)
+  const [bootError, setBootError] = React.useState<string | null>(null)
+  const [isStreaming, setIsStreaming] = React.useState(false)
+  // 当前待回答的 ask_user 请求（agent 在等 respondAskUser 回传，不答会挂起）
+  const [pendingAsk, setPendingAsk] = React.useState<AskUserRequest | null>(null)
   const chatEndRef = React.useRef<HTMLDivElement>(null)
 
   React.useEffect(() => {
@@ -119,32 +130,176 @@ export default function App(): React.ReactElement {
     return () => window.removeEventListener('message', handler)
   }, [])
 
-  const send = (): void => {
-    const text = inputValue.trim()
-    if (!text) return
-    setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'user', text }])
-    setInputValue('')
-    setTimeout(() => {
-      setMessages((prev) => [
-        ...prev,
-        { id: (Date.now() + 1).toString(), role: 'system', text: '收到，正在根据你的反馈修改……改好了，你看看右边效果？' },
-      ])
-    }, 800)
+  // W2.1：启动时绑定向导弹性 workspace，创建 session
+  React.useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const workspaces = await window.electronAPI.listAgentWorkspaces()
+        const guide = workspaces.find((w) => w.slug === 'guide-elasticity')
+        if (!guide) {
+          if (!cancelled) setBootError('向导弹性 workspace 未创建，请先运行 scripts/create-workspace.ts')
+          return
+        }
+        const channels = await window.electronAPI.listChannels()
+        const firstChannelId = channels[0]?.id
+        const session = await window.electronAPI.createAgentSession(
+          '向导弹性 · Wizard UI',
+          firstChannelId,
+          guide.id,
+        )
+        if (cancelled) return
+        setSessionId(session.id)
+        setChannelId(firstChannelId)
+        if (!firstChannelId) {
+          setBootError('未检测到可用渠道，请在 Proma 设置中添加一个渠道后重启')
+        }
+        setMessages([
+          { id: cuid(), role: 'system', text: '✅ 已连接向导弹性 workspace，告诉我你想做的应用吧。' },
+        ])
+      } catch (e) {
+        if (!cancelled) setBootError(`启动失败：${String(e)}`)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  // W2.2：从 SDK / Proma 事件提取内容，渲染到对话流
+  const appendAgentEvent = (payload: AgentStreamPayload): void => {
+    if (payload.kind === 'sdk_message') {
+      const msg = payload.message
+      if (msg.type === 'assistant') {
+        const a = msg as SDKAssistantMessage
+        if (a.isReplay) return // 跳过历史重放，避免重复渲染
+        const text = a.message.content
+          .filter((b): b is { type: 'text'; text: string } =>
+            (b as { type?: string }).type === 'text' && typeof (b as { text?: unknown }).text === 'string')
+          .map((b) => b.text)
+          .join('')
+        if (text.trim()) {
+          setMessages((prev) => [...prev, { id: cuid(), role: 'system', text }])
+        }
+      } else if (msg.type === 'result') {
+        setIsStreaming(false) // 一轮结束
+      }
+      return
+    }
+    if (payload.kind === 'proma_event') {
+      const evt = payload.event
+      if (evt.type === 'ask_user_request') {
+        const req = evt.request
+        // 防护：上一个 ask 未作答又来新的，旧请求会挂起。单 session 向导场景极少并发，
+        // 这里仅告警保留可观测性；W3 做请求排队。
+        setPendingAsk((prev) => {
+          if (prev) console.warn('[向导] 收到新 ask_user_request，但上一个未作答，旧请求可能挂起：', prev.requestId)
+          return req
+        })
+        const q = req.questions[0]
+        if (q) {
+          const extra = req.questions.length > 1 ? `（共 ${req.questions.length} 问，先回答第 1 个）` : ''
+          setMessages((prev) => [...prev, { id: cuid(), role: 'system', text: q.question + extra, options: q.options }])
+        }
+        setIsStreaming(false)
+      }
+    }
   }
 
-  // PRD 接口 7：纠错反馈
-  const closeCorrection = (feedback: string | null): void => {
+  // W2.2：订阅流式事件（按 sessionId 过滤，单 session 也写对，省得 W3 改）
+  React.useEffect(() => {
+    if (!sessionId) return
+    const offEvent = window.electronAPI.onAgentStreamEvent((evt: AgentStreamEvent) => {
+      if (evt.sessionId !== sessionId) return
+      appendAgentEvent(evt.payload)
+    })
+    const offComplete = window.electronAPI.onAgentStreamComplete((data: AgentStreamCompletePayload) => {
+      if (data.sessionId !== sessionId) return
+      setIsStreaming(false)
+    })
+    const offError = window.electronAPI.onAgentStreamError((data: { sessionId: string; error: string }) => {
+      if (data.sessionId !== sessionId) return
+      setMessages((prev) => [...prev, { id: cuid(), role: 'system', text: `❌ ${data.error}` }])
+      setIsStreaming(false)
+    })
+    return () => { offEvent(); offComplete(); offError() }
+    // appendAgentEvent 只用 setter，无需进依赖；按 sessionId 重订阅即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
+
+  // 回答当前 ask_user 请求（点选项或输入框作答都走这里 → respondAskUser）
+  const answerAsk = async (answerText: string): Promise<void> => {
+    const req = pendingAsk
+    if (!req) return
+    setPendingAsk(null)
+    setMessages((prev) => [...prev, { id: cuid(), role: 'user', text: answerText }])
+    setIsStreaming(true)
+    try {
+      // W3：多问题逐问作答；当前简化为对所有问题回填同一答案，保证请求被 resolve
+      const answers: Record<string, string> = {}
+      for (const q of req.questions) answers[q.question] = answerText
+      await window.electronAPI.respondAskUser({ requestId: req.requestId, answers })
+    } catch (e) {
+      setMessages((prev) => [...prev, { id: cuid(), role: 'system', text: `❌ 回答失败：${String(e)}` }])
+      setIsStreaming(false)
+    }
+  }
+
+  // W2.3：发送用户消息（有待答问题时走 respondAskUser，否则 sendAgentMessage）
+  const send = async (): Promise<void> => {
+    const text = inputValue.trim()
+    if (!text) return
+    if (pendingAsk) {
+      setInputValue('')
+      await answerAsk(text)
+      return
+    }
+    if (!sessionId || !channelId) {
+      // 连接未就绪：保留用户已输入内容，仅提示
+      setMessages((prev) => [...prev, { id: cuid(), role: 'system', text: '❌ 尚未连接（缺少会话或渠道），无法发送' }])
+      return
+    }
+    setInputValue('')
+    setMessages((prev) => [...prev, { id: cuid(), role: 'user', text }])
+    setIsStreaming(true)
+    try {
+      await window.electronAPI.sendAgentMessage({ sessionId, userMessage: text, channelId })
+    } catch (e) {
+      setMessages((prev) => [...prev, { id: cuid(), role: 'system', text: `❌ 发送失败：${String(e)}` }])
+      setIsStreaming(false)
+    }
+  }
+
+  // 点击 ask_user 选项作答
+  const chooseAskOption = (label: string): void => {
+    void answerAsk(label)
+  }
+
+  // W2.4：纠错反馈写入 workspace（薄沙箱）
+  const closeCorrection = async (feedback: string | null): Promise<void> => {
+    const element = correction
     setCorrection(null)
     document.querySelector('iframe')?.contentWindow?.postMessage('clear-highlight', '*')
-    if (feedback) {
-      setMessages((prev) => [
-        ...prev,
-        { id: Date.now().toString(), role: 'user', text: `🔧 纠错: ${feedback}` },
-      ])
+    if (!feedback) return
+    if (!sessionId) {
+      setMessages((prev) => [...prev, { id: cuid(), role: 'user', text: `🔧 纠错: ${feedback}（未连接，未写入）` }])
+      return
+    }
+    const slug = 'guide-elasticity' // W3 再做成活的选择器
+    const path = `corrections/${Date.now()}.json`
+    const content = JSON.stringify({ sessionId, element, feedback, ts: new Date().toISOString() }, null, 2)
+    try {
+      const r = await window.electronAPI.writeToWorkspace(slug, path, content)
+      setMessages((prev) => [...prev, {
+        id: cuid(),
+        role: 'user',
+        text: r.success ? `🔧 纠错已记录 → ${path}` : `❌ 写入失败：${r.error}`,
+      }])
+    } catch (e) {
+      setMessages((prev) => [...prev, { id: cuid(), role: 'user', text: `❌ 写入异常：${String(e)}` }])
     }
   }
 
   return (
+
     <div className="h-screen flex flex-col shell-bg">
       {/* ===== 顶栏 ===== */}
       <header className="flex items-center gap-3 px-5 py-3 shrink-0">
@@ -160,9 +315,24 @@ export default function App(): React.ReactElement {
       <div className="flex-1 flex min-h-0 px-2 pb-2 gap-2">
         {/* ---- 左：对话区 ---- */}
         <div className="flex-1 min-w-0 bg-card rounded-2xl shadow-minimal flex flex-col overflow-hidden">
-          <div className="px-5 py-3 border-b border-border text-sm font-semibold text-muted-foreground shrink-0">
-            💬 对话
+          <div className="px-5 py-3 border-b border-border text-sm font-semibold text-muted-foreground shrink-0 flex items-center justify-between">
+            <span>💬 对话</span>
+            <span className="text-[11px] font-normal">
+              {sessionId ? (
+                <span className="text-green-400">● 已连接</span>
+              ) : bootError ? (
+                <span className="text-red-400">● 未连接</span>
+              ) : (
+                <span className="text-muted-foreground">○ 连接中…</span>
+              )}
+            </span>
           </div>
+
+          {bootError && (
+            <div className="mx-4 mt-3 px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-xs leading-relaxed shrink-0">
+              ⚠️ {bootError}
+            </div>
+          )}
 
           <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4 scrollbar-thin">
             {messages.map((msg) => (
@@ -183,16 +353,11 @@ export default function App(): React.ReactElement {
                     <div className="flex flex-wrap gap-2 mt-3">
                       {msg.options.map((opt) => (
                         <Button
-                          key={opt.value}
+                          key={opt.label}
                           variant="outline"
                           size="sm"
                           className="rounded-xl"
-                          onClick={() =>
-                            setMessages((prev) => [
-                              ...prev,
-                              { id: Date.now().toString(), role: 'user', text: opt.label },
-                            ])
-                          }
+                          onClick={() => chooseAskOption(opt.label)}
                         >
                           {opt.label}
                         </Button>
@@ -202,6 +367,14 @@ export default function App(): React.ReactElement {
                 </div>
               </div>
             ))}
+            {isStreaming && (
+              <div className="flex justify-start">
+                <div className="bg-muted text-muted-foreground rounded-2xl rounded-bl-md border border-border px-4 py-3 text-sm">
+                  <span className="text-[11px] text-primary font-semibold">🤖 向导 Agent</span>
+                  <span className="ml-2 animate-pulse">思考中…</span>
+                </div>
+              </div>
+            )}
             <div ref={chatEndRef} />
           </div>
 
@@ -211,12 +384,14 @@ export default function App(): React.ReactElement {
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void send() }
               }}
-              placeholder="输入你的需求..."
+              placeholder={pendingAsk ? '输入你的回答…' : '输入你的需求...'}
               className="flex-1 rounded-xl"
             />
-            <Button onClick={send} size="sm">发送</Button>
+            <Button onClick={() => void send()} size="sm" disabled={isStreaming}>
+              {isStreaming ? '…' : '发送'}
+            </Button>
           </div>
         </div>
 
